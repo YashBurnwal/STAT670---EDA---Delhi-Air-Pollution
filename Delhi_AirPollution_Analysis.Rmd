@@ -1,0 +1,794 @@
+---
+title: "Delhi Air Pollution"
+subtitle: "STAT-670: Final Project"
+author: "Yashkumar Burnwal"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    fig_width: 10
+    fig_height: 6
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.align = "center",
+  fig.retina = 2
+)
+```
+
+```{r libraries}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(corrplot)
+library(viridis)
+library(scales)
+library(gridExtra)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+```
+
+------------------------------------------------------------------------
+
+# Load and Inspect the Data
+
+## Read the Data
+
+```{r load-data}
+# Read the CSV into a dataframe
+pollution <- read.csv("Delhi_6Station_Hourly.csv", stringsAsFactors = FALSE)
+
+# Basic dimensions
+cat("Rows:", nrow(pollution), "| Columns:", ncol(pollution), "\n")
+cat("Stations:", length(unique(pollution$loc)), "\n")
+```
+
+## Data Structure
+
+```{r structure}
+str(pollution)
+```
+
+## Summary Statistics
+
+```{r summary}
+summary(pollution)
+```
+
+## First Few Rows
+
+```{r head}
+head(pollution) %>%
+  kable(caption = "First 6 rows of the dataset") %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"), 
+                full_width = FALSE, font_size = 12)
+head(pollution)
+```
+
+## Variable Classification
+
+The dataset contains the following variable categories:
+
+### Date/Time Components
+
+-   `year`, `month`, `day`, `hour`
+
+### PM2.5 (Primary Response Variable)
+
+-   `PM2.5` – Fine particulate matter (μg/m³)
+
+### Other Pollutants
+
+| Variable | Description               | Unit  |
+|----------|---------------------------|-------|
+| PM10     | Coarse particulate matter | μg/m³ |
+| NO       | Nitric oxide              | ppb   |
+| NO2      | Nitrogen dioxide          | ppb   |
+| NOx      | Total nitrogen oxides     | ppb   |
+| SO2      | Sulfur dioxide            | ppb   |
+| CO       | Carbon monoxide           | mg/m³ |
+| Ozone    | Ground-level ozone        | ppb   |
+| NH3      | Ammonia                   | ppb   |
+| Benzene  | Benzene                   | μg/m³ |
+
+### Meteorological Variables
+
+| Variable | Description         | Unit    |
+|----------|---------------------|---------|
+| AT       | Ambient Temperature | °C      |
+| BP       | Barometric Pressure | hPa     |
+| SR       | Solar Radiation     | W/m²    |
+| RH       | Relative Humidity   | \%      |
+| WS       | Wind Speed          | m/s     |
+| WD       | Wind Direction      | degrees |
+
+### Location
+
+-   `loc` – Station name
+
+> **PM2.5 confirmed as the primary target variable**
+
+# Construct Proper Datetime and Clean Data
+
+## Create DateTime Features
+
+We combine the year–month–day–hour columns into a proper POSIXct timestamp and derive useful time-based features.
+
+```{r datetime-features}
+pollution <- pollution %>%
+  mutate(
+    datetime = make_datetime(year, month, day, hour),
+    date = as.Date(datetime),
+    hour_of_day = hour,                                # 0-23
+    dow = wday(datetime, label = TRUE, abbr = FALSE),  # Weekday factor
+    month_name = month(datetime, label = TRUE),        # Month factor
+    is_weekend = dow %in% c("Saturday", "Sunday")
+  )
+
+# Verify datetime range
+cat("Date range:", as.character(min(pollution$date)), "to", 
+    as.character(max(pollution$date)), "\n")
+```
+
+## Missing Values Analysis
+
+```{r missing-values}
+# Count missing values per variable
+missing_counts <- pollution %>%
+  summarise(across(everything(), ~sum(is.na(.)))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Missing_Count") %>%
+  filter(Missing_Count > 0) %>%
+  arrange(desc(Missing_Count))
+
+if(nrow(missing_counts) > 0) {
+  missing_counts %>%
+    kable(caption = "Variables with Missing Values") %>%
+    kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+} else {
+  cat("No missing values found in the dataset.\n")
+}
+
+# Rows with missing PM2.5
+n_missing_pm25 <- sum(is.na(pollution$PM2.5))
+cat("\nRows with missing PM2.5:", n_missing_pm25, "\n")
+```
+
+## Outlier Check
+
+```{r outlier-check}
+outlier_summary <- pollution %>%
+  summarise(
+    PM25_negative = sum(PM2.5 < 0, na.rm = TRUE),
+    PM25_extreme_high = sum(PM2.5 > 999, na.rm = TRUE),
+    AT_below_minus10 = sum(AT < -10, na.rm = TRUE),
+    AT_above_55 = sum(AT > 55, na.rm = TRUE),
+    RH_out_of_range = sum(RH < 0 | RH > 100, na.rm = TRUE),
+    WS_negative = sum(WS < 0, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Check", values_to = "Count")
+
+outlier_summary %>%
+  kable(caption = "Outlier Check Summary") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+# Explore PM2.5 Over Time
+
+## Basic Descriptive Statistics
+
+```{r pm25-stats}
+pm25_stats <- pollution %>%
+  summarise(
+    Mean = mean(PM2.5, na.rm = TRUE),
+    Median = median(PM2.5, na.rm = TRUE),
+    SD = sd(PM2.5, na.rm = TRUE),
+    Min = min(PM2.5, na.rm = TRUE),
+    Q25 = quantile(PM2.5, 0.25, na.rm = TRUE),
+    Q75 = quantile(PM2.5, 0.75, na.rm = TRUE),
+    Q90 = quantile(PM2.5, 0.90, na.rm = TRUE),
+    Q99 = quantile(PM2.5, 0.99, na.rm = TRUE),
+    Max = max(PM2.5, na.rm = TRUE)
+  ) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  mutate(Value = round(Value, 2))
+
+pm25_stats %>%
+  kable(caption = "PM2.5 Descriptive Statistics (μg/m³)") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+## Distribution of PM2.5
+
+```{r}
+ggplot(pollution, aes(x = PM2.5)) +
+  geom_histogram(
+    binwidth = 15,
+    fill = "steelblue",
+    alpha = 0.7,
+    color = "white"
+  ) +
+  geom_vline(
+    xintercept = median(pollution$PM2.5, na.rm = TRUE),
+    color = "orange",
+    linetype = "dashed",
+    linewidth = 1
+  ) +
+  scale_x_continuous(limits = c(0, 500)) +
+  labs(
+    title = "Frequency vs PM2.5 Range (Binwidth = 15 μg/m³)",
+    x = "PM2.5 (μg/m³)",
+    y = "Frequency",
+    subtitle = "Orange dashed line = median"
+  ) +
+  theme_minimal(base_size = 12)
+
+
+```
+
+```{r histogram, fig.cap="Distribution of PM2.5 concentrations with density overlay"}
+ggplot(pollution, aes(x = PM2.5)) +
+  geom_histogram(aes(y = after_stat(density)), bins = 80, fill = "steelblue", 
+                 alpha = 0.7, color = "white") +
+  geom_density(color = "darkred", linewidth = 1) +
+  geom_vline(xintercept = median(pollution$PM2.5, na.rm = TRUE), 
+             color = "orange", linetype = "dashed", linewidth = 1) +
+  scale_x_continuous(limits = c(0, 500)) +
+  labs(title = "Distribution of PM2.5 Concentrations",
+       subtitle = "Orange dashed line = median | Red curve = density",
+       x = "PM2.5 (μg/m³)", y = "Density") +
+  theme_minimal(base_size = 12)
+```
+
+The distribution is **right-skewed**, typical of air pollution data. The long right tail represents pollution episodes, particularly during winter months.
+
+## Full Time Series
+
+```{r timeseries, fig.height=5, fig.cap="Daily mean PM2.5 over the study period"}
+# Aggregate to daily means for cleaner visualization
+daily_pm25 <- pollution %>%
+  group_by(date) %>%
+  summarise(
+    daily_PM25 = mean(PM2.5, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+ggplot(daily_pm25, aes(x = date, y = daily_PM25)) +
+  geom_line(color = "steelblue", alpha = 0.8) +
+  geom_smooth(method = "loess", span = 0.1, se = FALSE, color = "darkred", 
+              linewidth = 1.2) +
+  geom_hline(yintercept = 35, color = "green", linetype = "dashed", linewidth = 0.8) +
+  annotate("text", x = as.Date("2018-07-01"), y = 45, 
+           label = "WHO 24-hr guideline (35 μg/m³)", color = "darkgreen", size = 3) +
+  labs(title = "Daily Mean PM2.5 Over Time (June 2018 - October 2019)",
+       subtitle = "Red line = LOESS smoother",
+       x = "Date", y = "Daily Mean PM2.5 (μg/m³)") +
+  theme_minimal(base_size = 12) +
+  scale_x_date(date_breaks = "2 months", date_labels = "%b %Y")
+```
+
+**Key observations:**
+
+-   Strong **seasonal pattern** with winter peaks (Nov-Jan) and monsoon lows (Jul-Sep)
+-   Daily values frequently exceed WHO guideline (35 μg/m³)
+-   Winter 2018-19 shows extreme episodes exceeding 300 μg/m³
+
+## Hourly (Diurnal) Cycle
+
+```{r hourly-pattern, fig.cap="Mean PM2.5 by hour of day"}
+hourly_pattern <- pollution %>%
+  group_by(hour_of_day) %>%
+  summarise(
+    mean_PM25 = mean(PM2.5, na.rm = TRUE),
+    se_PM25 = sd(PM2.5, na.rm = TRUE) / sqrt(n()),
+    .groups = "drop"
+  )
+
+ggplot(hourly_pattern, aes(x = hour_of_day, y = mean_PM25)) +
+  geom_ribbon(aes(ymin = mean_PM25 - 1.96*se_PM25, 
+                  ymax = mean_PM25 + 1.96*se_PM25), 
+              fill = "steelblue", alpha = 0.3) +
+  geom_line(color = "steelblue", linewidth = 1.2) +
+  geom_point(color = "darkblue", size = 2.5) +
+  scale_x_continuous(breaks = 0:23) +
+  labs(title = "Diurnal Pattern of PM2.5",
+       subtitle = "Shaded area = 95% confidence interval",
+       x = "Hour of Day (0-23)", y = "Mean PM2.5 (μg/m³)") +
+  theme_minimal(base_size = 12)
+```
+
+```{r hourly-interpretation}
+peak_hour <- hourly_pattern$hour_of_day[which.max(hourly_pattern$mean_PM25)]
+low_hour <- hourly_pattern$hour_of_day[which.min(hourly_pattern$mean_PM25)]
+cat("Peak PM2.5 hour:", peak_hour, ":00\n")
+cat("Lowest PM2.5 hour:", low_hour, ":00\n")
+```
+
+**Interpretation:**
+
+-   **Peak hours:** Morning (8-10 AM) and late evening (9-11 PM) - coinciding with rush hour traffic and shallow boundary layer
+-   **Minimum:** Afternoon (2-4 PM) - when convective mixing is strongest and pollutants disperse vertically
+
+## Day-of-Week Pattern
+
+```{r dow-pattern, fig.cap="PM2.5 distribution by day of week"}
+ggplot(pollution, aes(x = dow, y = PM2.5, fill = dow)) +
+  geom_boxplot(outlier.alpha = 0.1, outlier.size = 0.5) +
+  scale_y_continuous(limits = c(0, 400)) +
+  scale_fill_viridis_d() +
+  labs(title = "PM2.5 by Day of Week",
+       x = "Day of Week", y = "PM2.5 (μg/m³)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+```
+
+```{r weekday-weekend}
+weekend_compare <- pollution %>%
+  group_by(is_weekend) %>%
+  summarise(
+    Mean_PM25 = mean(PM2.5, na.rm = TRUE),
+    Median_PM25 = median(PM2.5, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(Period = ifelse(is_weekend, "Weekend", "Weekday"))
+
+weekend_compare %>%
+  select(Period, Mean_PM25, Median_PM25) %>%
+  kable(caption = "Weekday vs Weekend PM2.5", digits = 2) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+The weekday-weekend difference is **modest** in Delhi compared to Western cities, likely because:
+
+-   Delhi has less rigid work schedules
+-   Traffic and commercial activity persist on weekends
+-   Dominant pollution sources (dust, burning) are not work-schedule dependent
+
+## Monthly/Seasonal Pattern
+
+```{r monthly-boxplot, fig.height=6, fig.cap="Monthly distribution of PM2.5"}
+pollution <- pollution %>%
+  mutate(year_month = floor_date(date, "month"))
+
+ggplot(pollution, aes(x = factor(year_month), y = PM2.5)) +
+  geom_boxplot(fill = "steelblue", alpha = 0.7, outlier.alpha = 0.1) +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "Monthly Distribution of PM2.5 (June 2018 - October 2019)",
+       x = "Month", y = "PM2.5 (μg/m³)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Seasonal Interpretation:**
+
+| Season | Months | PM2.5 Level | Key Drivers |
+|------------------|------------------|------------------|------------------|
+| **Winter** | Nov–Jan | Very High (200-400+) | Temperature inversions, crop burning, heating emissions, low wind |
+| **Pre-Monsoon** | Mar–May | Moderate-High | Dust storms, high temperatures |
+| **Monsoon** | Jun–Sep | Low (40-80) | Rain washout, humid air, clean maritime air masses |
+| **Post-Monsoon** | Oct–Nov | Rising | Diwali fireworks, crop residue burning begins |
+
+# Explore Relationships with Other Variables
+
+## Correlation Matrix
+
+```{r}
+# Select numeric variables
+numeric_vars <- pollution %>%
+  select(PM2.5, PM10, AT, BP, SR, RH, WS, NO, NO2, SO2, Ozone, CO, Benzene, NH3, NOx) %>%
+  na.omit()
+
+# Correlation matrix
+cor_matrix <- cor(numeric_vars, use = "complete.obs")
+
+# Convert to long format for ggplot2
+cor_long <- melt(cor_matrix)
+
+# Pretty heatmap
+ggplot(cor_long, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  
+  # Gradient colors
+  scale_fill_gradient2(
+    low = "#8b0000",   # dark red
+    mid = "white",
+    high = "#003f5c",  # navy blue
+    midpoint = 0,
+    limit = c(-1, 1),
+    name = "Correlation"
+  ) +
+  
+  geom_text(aes(label = sprintf("%.2f", value)), color = "black", size = 3) +
+  
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    panel.grid = element_blank(),
+    plot.title = element_text(size = 16, face = "bold", hjust = 0.5)
+  ) +
+  labs(
+    title = "Correlation Heatmap of Pollutants and Meteorology",
+    x = "",
+    y = ""
+  )
+
+```
+
+## Correlations with PM2.5
+
+```{r pm25-correlations}
+pm25_correlations <- data.frame(
+  Variable = rownames(cor_matrix),
+  Correlation = cor_matrix[, "PM2.5"]
+) %>%
+  filter(Variable != "PM2.5") %>%
+  arrange(desc(abs(Correlation))) %>%
+  mutate(Correlation = round(Correlation, 3))
+
+# REMOVE rownames to avoid duplicate column in kable
+rownames(pm25_correlations) <- NULL
+
+pm25_correlations %>%
+  kable(caption = "Correlations with PM2.5 (sorted by absolute value)", row.names = FALSE) %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(1:5, bold = TRUE, background = "#f0f8ff")
+
+```
+
+**Top predictors** (highlighted) show strong associations with PM2.5:
+
+-   **PM10** (strongest) - PM2.5 is a subset of PM10; same emission sources
+-   **CO, NO2, NOx** - Common combustion sources (vehicles, burning)
+-   **AT (negative)** - Cold weather traps pollutants; inversions
+
+## Scatterplots for Top Predictors
+
+```{r scatterplots, fig.height=10, fig.width=12, fig.cap="Scatterplots of PM2.5 vs top predictors"}
+# Sample data for cleaner plots
+plot_sample <- pollution %>% sample_n(5000)
+
+# PM2.5 vs PM10
+p1 <- ggplot(plot_sample, aes(x = PM10, y = PM2.5)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  geom_smooth(method = "loess", color = "darkgreen", se = FALSE, linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 600)) +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "PM2.5 vs PM10", subtitle = "Red: Linear | Green: LOESS",
+       x = "PM10 (μg/m³)", y = "PM2.5 (μg/m³)") +
+  theme_minimal()
+
+# PM2.5 vs CO
+p2 <- ggplot(plot_sample, aes(x = CO, y = PM2.5)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", color = "red", se = TRUE) +
+  geom_smooth(method = "loess", color = "darkgreen", se = FALSE, linetype = "dashed") +
+  scale_x_continuous(limits = c(0, 5)) +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "PM2.5 vs CO", x = "CO (mg/m³)", y = "PM2.5 (μg/m³)") +
+  theme_minimal()
+
+# PM2.5 vs AT (temperature)
+p3 <- ggplot(plot_sample, aes(x = AT, y = PM2.5)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "PM2.5 vs Temperature", subtitle = "Strong nonlinearity at low temps",
+       x = "Temperature (°C)", y = "PM2.5 (μg/m³)") +
+  theme_minimal()
+
+# PM2.5 vs RH
+p4 <- ggplot(plot_sample, aes(x = RH, y = PM2.5)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "loess", color = "darkred", se = TRUE) +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "PM2.5 vs Relative Humidity",
+       x = "Relative Humidity (%)", y = "PM2.5 (μg/m³)") +
+  theme_minimal()
+
+grid.arrange(p1, p2, p3, p4, ncol = 2)
+```
+
+**Observations:**
+
+-   **PM2.5 vs PM10:** Strong positive linear relationship (expected co-emission)
+-   **PM2.5 vs CO:** Positive relationship (common combustion sources)
+-   **PM2.5 vs AT:** **Nonlinear** - high PM2.5 concentrations cluster at low temperatures (winter inversions)
+-   **PM2.5 vs RH:** Complex - moderate humidity can enhance particle growth; very high humidity during monsoon coincides with washout
+
+## Trivariate Visualizations
+
+### PM2.5 vs NO2 by Hour of Day
+
+```{r trivariate-hour, fig.height=7, fig.cap="PM2.5 vs NO2 colored by hour of day"}
+ggplot(pollution %>% sample_n(8000), 
+       aes(x = NO2, y = PM2.5, color = factor(hour_of_day))) +
+  geom_point(alpha = 0.5, size = 1) +
+  scale_color_viridis_d(option = "plasma") +
+  scale_y_continuous(limits = c(0, 400)) +
+  scale_x_continuous(limits = c(0, 150)) +
+  labs(title = "PM2.5 vs NO2 by Hour of Day",
+       subtitle = "Yellow = daytime hours | Purple = nighttime hours",
+       x = "NO2 (ppb)", y = "PM2.5 (μg/m³)", color = "Hour") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "right")
+```
+
+The hour-colored plot reveals that **morning hours (8-10 AM)** show elevated NO2-PM2.5 relationships - consistent with traffic rush hour emissions.
+
+### PM2.5 vs Relative Humidity by Season
+
+```{r trivariate-season, fig.height=8, fig.cap="PM2.5 vs RH by season, colored by temperature"}
+# Create season variable
+pollution <- pollution %>%
+  mutate(season = case_when(
+    month %in% c(12, 1, 2) ~ "Winter",
+    month %in% c(3, 4, 5) ~ "Pre-Monsoon",
+    month %in% c(6, 7, 8, 9) ~ "Monsoon",
+    month %in% c(10, 11) ~ "Post-Monsoon"
+  ),
+  season = factor(season, levels = c("Monsoon", "Post-Monsoon", "Winter", "Pre-Monsoon")))
+
+ggplot(pollution %>% sample_n(10000), 
+       aes(x = RH, y = PM2.5, color = AT)) +
+  geom_point(alpha = 0.4, size = 1) +
+  facet_wrap(~season, ncol = 2) +
+  scale_color_viridis_c(option = "magma") +
+  scale_y_continuous(limits = c(0, 500)) +
+  labs(title = "PM2.5 vs Relative Humidity by Season",
+       subtitle = "Color gradient shows temperature",
+       x = "Relative Humidity (%)", y = "PM2.5 (μg/m³)", color = "Temp (°C)") +
+  theme_minimal(base_size = 12)
+```
+
+**Insights from trivariate plot:**
+
+-   **Winter:** Extreme PM2.5 across all humidity levels; cold temperatures (purple) dominate
+-   **Monsoon:** Universally low PM2.5 due to rain washout effect
+-   **Post-Monsoon:** Transition period with rising pollution as crop burning begins
+-   The **temperature gradient** clearly separates seasons and pollution regimes
+
+------------------------------------------------------------------------
+
+# Training/Testing Split and Modeling
+
+## Define Train/Test Split
+
+```{r train-test-split}
+train_start <- as.Date("2018-06-01")
+train_end <- as.Date("2019-06-01")
+test_start <- as.Date("2019-06-02")
+test_end <- as.Date("2019-10-01")
+
+pollution_train <- pollution %>% filter(date >= train_start & date <= train_end)
+pollution_test <- pollution %>% filter(date >= test_start & date <= test_end)
+
+cat("Training period:", as.character(train_start), "to", as.character(train_end), "\n")
+cat("Training observations:", format(nrow(pollution_train), big.mark = ","), "\n\n")
+cat("Testing period:", as.character(test_start), "to", as.character(test_end), "\n")
+cat("Testing observations:", format(nrow(pollution_test), big.mark = ","), "\n")
+```
+
+## Aggregate to Daily Dataset
+
+For interpretable modeling, we aggregate hourly data to daily means.
+
+```{r daily-aggregation}
+daily_train <- pollution_train %>%
+  group_by(date) %>%
+  summarise(
+    daily_PM25 = mean(PM2.5, na.rm = TRUE),
+    daily_PM10 = mean(PM10, na.rm = TRUE),
+    daily_NO2 = mean(NO2, na.rm = TRUE),
+    daily_NOx = mean(NOx, na.rm = TRUE),
+    daily_CO = mean(CO, na.rm = TRUE),
+    daily_SO2 = mean(SO2, na.rm = TRUE),
+    daily_Ozone = mean(Ozone, na.rm = TRUE),
+    daily_AT = mean(AT, na.rm = TRUE),
+    daily_RH = mean(RH, na.rm = TRUE),
+    daily_WS = mean(WS, na.rm = TRUE),
+    daily_SR = mean(SR, na.rm = TRUE),
+    daily_BP = mean(BP, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    dow = wday(date, label = TRUE),
+    month = month(date)
+  )
+
+daily_test <- pollution_test %>%
+  group_by(date) %>%
+  summarise(
+    daily_PM25 = mean(PM2.5, na.rm = TRUE),
+    daily_PM10 = mean(PM10, na.rm = TRUE),
+    daily_NO2 = mean(NO2, na.rm = TRUE),
+    daily_NOx = mean(NOx, na.rm = TRUE),
+    daily_CO = mean(CO, na.rm = TRUE),
+    daily_SO2 = mean(SO2, na.rm = TRUE),
+    daily_Ozone = mean(Ozone, na.rm = TRUE),
+    daily_AT = mean(AT, na.rm = TRUE),
+    daily_RH = mean(RH, na.rm = TRUE),
+    daily_WS = mean(WS, na.rm = TRUE),
+    daily_SR = mean(SR, na.rm = TRUE),
+    daily_BP = mean(BP, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    dow = wday(date, label = TRUE),
+    month = month(date)
+  )
+
+cat("Daily training observations:", nrow(daily_train), "days\n")
+cat("Daily testing observations:", nrow(daily_test), "days\n")
+```
+
+## Multiple Linear Regression
+
+We fit a multiple linear regression using the strongest predictors identified from correlation analysis.
+
+```{r linear-model}
+model_lm <- lm(daily_PM25 ~ daily_PM10 + daily_NO2 + daily_NOx + daily_CO + 
+                            daily_AT + daily_RH + daily_WS + daily_Ozone,
+               data = daily_train)
+
+summary(model_lm)
+```
+
+### Model Interpretation
+
+```{r model-interpretation}
+# Extract key metrics
+r_squared <- summary(model_lm)$r.squared
+adj_r_squared <- summary(model_lm)$adj.r.squared
+coef_df <- broom::tidy(model_lm) %>%
+  mutate(
+    significant = p.value < 0.05,
+    estimate = round(estimate, 4),
+    std.error = round(std.error, 4),
+    statistic = round(statistic, 2),
+    p.value = format.pval(p.value, digits = 3)
+  )
+
+coef_df %>%
+  kable(caption = "Linear Regression Coefficients") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE) %>%
+  row_spec(which(coef_df$significant), bold = TRUE)
+```
+
+```{r r-squared}
+cat("R-squared:", round(r_squared, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r_squared, 4), "\n")
+cat("\nThe model explains", round(r_squared * 100, 1), "% of variance in daily PM2.5.\n")
+```
+
+**Coefficient interpretations:**
+
+| Variable | Sign | Physical Interpretation |
+|------------------------|------------------------|------------------------|
+| PM10 | \+ | Expected; PM2.5 is a subset of PM10 |
+| AT | − | Higher temperature = better mixing = lower PM2.5 |
+| WS | − | Higher wind speed = better dispersion |
+| Ozone | − | Photochemical regime; high ozone often indicates cleaner conditions |
+| RH | \+ | Hygroscopic growth increases particle mass |
+
+### Diagnostic Plots
+
+```{r diagnostics, fig.height=8, fig.width=10, fig.cap="Regression diagnostic plots"}
+par(mfrow = c(2, 2))
+plot(model_lm)
+par(mfrow = c(1, 1))
+```
+
+**Diagnostic assessment:**
+
+-   **Residuals vs Fitted:** Some heteroscedasticity at higher values (expected for pollution data)
+-   **Q-Q Plot:** Reasonable normality with slight deviation in tails
+-   **Scale-Location:** Confirms mild heteroscedasticity
+-   **Residuals vs Leverage:** A few influential points but no extreme outliers
+
+## Test Set Evaluation
+
+```{r test-evaluation}
+# Predictions from base model
+predictions_lm <- predict(model_lm, newdata = daily_test)
+
+# Handle any NAs
+valid_idx <- !is.na(predictions_lm) & !is.na(daily_test$daily_PM25)
+predictions_lm_valid <- predictions_lm[valid_idx]
+actual_test <- daily_test$daily_PM25[valid_idx]
+
+# Calculate metrics
+rmse_lm <- sqrt(mean((predictions_lm_valid - actual_test)^2))
+mae_lm <- mean(abs(predictions_lm_valid - actual_test))
+mape_lm <- mean(abs((predictions_lm_valid - actual_test) / actual_test)) * 100
+
+# Training metrics for comparison
+predictions_train <- predict(model_lm, newdata = daily_train)
+rmse_train <- sqrt(mean((predictions_train - daily_train$daily_PM25)^2, na.rm = TRUE))
+mae_train <- mean(abs(predictions_train - daily_train$daily_PM25), na.rm = TRUE)
+```
+
+```{r metrics-table}
+metrics_df <- data.frame(
+  Metric = c("RMSE (μg/m³)", "MAE (μg/m³)", "MAPE (%)"),
+  Training = c(round(rmse_train, 2), round(mae_train, 2), NA),
+  Test = c(round(rmse_lm, 2), round(mae_lm, 2), round(mape_lm, 2))
+)
+
+metrics_df %>%
+  kable(caption = "Model Performance Metrics") %>%
+  kable_styling(bootstrap_options = c("striped", "hover"), full_width = FALSE)
+```
+
+### Predicted vs Actual Plot
+
+```{r}
+test_results <- data.frame(
+  actual = actual_test,
+  predicted = predictions_lm_valid
+)
+
+ggplot(test_results, aes(x = actual, y = predicted)) +
+  
+  # Blue dots = predictions vs actual
+  geom_point(aes(color = "Observed Points"), alpha = 0.6, size = 2.5) +
+  
+  # Red dashed line = perfect prediction line
+  geom_abline(aes(color = "Perfect Prediction Line"), 
+              intercept = 0, slope = 1,
+              linetype = "dashed", linewidth = 1) +
+  
+  # Green line = fitted regression line
+  geom_smooth(aes(color = "Fitted Trend Line"), 
+              method = "lm", se = TRUE, linewidth = 0.8) +
+  
+  scale_color_manual(
+    name = "Legend",
+    values = c(
+      "Observed Points" = "steelblue",
+      "Perfect Prediction Line" = "red",
+      "Fitted Trend Line" = "darkgreen"
+    )
+  ) +
+  
+  labs(
+    title = "Predicted vs Actual PM2.5 (Test Set: July–October 2019)",
+    subtitle = paste0("RMSE = ", round(rmse_lm, 2),
+                      " μg/m³ | MAE = ", round(mae_lm, 2), " μg/m³"),
+    x = "Actual Daily PM2.5 (μg/m³)",
+    y = "Predicted Daily PM2.5 (μg/m³)"
+  ) +
+  
+  coord_fixed(ratio = 1) +
+  theme_minimal(base_size = 12)
+
+```
+
+### Prediction Time Series
+
+```{r prediction-timeseries, fig.cap="Time series of actual vs predicted PM2.5"}
+daily_test$predicted <- NA
+daily_test$predicted[valid_idx] <- predictions_lm_valid
+
+ggplot(daily_test, aes(x = date)) +
+  geom_line(aes(y = daily_PM25, color = "Actual"), linewidth = 1) +
+  geom_line(aes(y = predicted, color = "Predicted"), linewidth = 1, linetype = "dashed") +
+  scale_color_manual(values = c("Actual" = "steelblue", "Predicted" = "darkred")) +
+  labs(title = "Daily PM2.5: Actual vs Predicted (Test Period: June-Oct 2019)",
+       x = "Date", y = "Daily Mean PM2.5 (μg/m³)", color = "") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+```
